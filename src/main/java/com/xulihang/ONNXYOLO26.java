@@ -63,6 +63,11 @@ public class ONNXYOLO26 {
         }
     }
 
+    public void setInputSize(int width, int height) {
+        this.inputWidth = width;
+        this.inputHeight = height;
+    }
+
     /**
      * 検出結果を表すクラス
      */
