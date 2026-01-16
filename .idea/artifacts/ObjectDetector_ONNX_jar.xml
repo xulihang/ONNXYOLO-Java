@@ -1,0 +1,8 @@
+<component name="ArtifactManager">
+  <artifact type="jar" name="ObjectDetector-ONNX:jar">
+    <output-path>$PROJECT_DIR$/out/artifacts/ObjectDetector_ONNX_jar</output-path>
+    <root id="archive" name="ObjectDetector-ONNX.jar">
+      <element id="module-output" name="ObjectDetector-ONNX" />
+    </root>
+  </artifact>
+</component>
