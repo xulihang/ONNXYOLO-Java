@@ -10,19 +10,19 @@ import java.nio.file.Paths;
 import java.util.*;
 
 /**
- * RT-DETR (PaddleDetection 导出) ONNX 检测器
+ * RF-DETR (PaddleDetection 导出) ONNX 检测器
  *
- * 适用于文字/漫画文字检测等 RT-DETR 模型, 例如 inference_model.onnx:
+ * 适用于文字/漫画文字检测等 RF-DETR 模型, 例如 inference_model.onnx:
  *   输入:  [1, 3, 512, 512]  (拉伸到 512x512, 非 letterbox)
  *   输出1: dets   [1, 300, 4]  归一化框 [cx, cy, w, h]
  *   输出2: labels [1, 300, C]  类别原始 logits (C = 类别数)
  *
  * 与 YOLO 的关键区别:
  *   1. 预处理用拉伸 (keep_ratio=false) + ImageNet 归一化 ((x/255-mean)/std), 不做 letterbox
- *   2. RT-DETR 用 focal loss 训练, 分类是逐类 sigmoid (不是 softmax),
+ *   2. RF-DETR 用 focal loss 训练, 分类是逐类 sigmoid (不是 softmax),
  *      必须对 logits 逐类做 sigmoid, 再取 argmax; 否则背景 query 会被误判为高置信度
  */
-public class ONNXRTDETR {
+public class ONNXRFDETR {
 
     // 类别名 (漫画/图片文字检测 5 类; 按模型实际输出类别数使用)
     private static final String[] CLASS_NAMES = {
@@ -40,11 +40,11 @@ public class ONNXRTDETR {
     private String detsOutputName;   // 框输出 [1, 300, 4] = [cx, cy, w, h]
     private String labelsOutputName; // 类别输出 [1, 300, C] = 原始 logits
 
-    // ImageNet 归一化参数 (PaddleDetection RT-DETR), 顺序 R,G,B
+    // ImageNet 归一化参数 (PaddleDetection RF-DETR), 顺序 R,G,B
     private static final float[] MEAN = {0.485f, 0.456f, 0.406f};
     private static final float[] STD = {0.229f, 0.224f, 0.225f};
 
-    public ONNXRTDETR(String onnxPath) throws OrtException {
+    public ONNXRFDETR(String onnxPath) throws OrtException {
         env = OrtEnvironment.getEnvironment();
         OrtSession.SessionOptions sessionOptions = new OrtSession.SessionOptions();
         session = env.createSession(Paths.get(onnxPath).toAbsolutePath().toString(), sessionOptions);
@@ -72,7 +72,7 @@ public class ONNXRTDETR {
             }
         }
         if (detsOutputName == null || labelsOutputName == null) {
-            throw new IllegalStateException("无法识别 RT-DETR 输出: " + outputInfo.keySet());
+            throw new IllegalStateException("无法识别 RF-DETR 输出: " + outputInfo.keySet());
         }
     }
 
@@ -158,7 +158,7 @@ public class ONNXRTDETR {
         int numClasses = labels[0].length;
 
         for (int q = 0; q < dets.length; q++) {
-            // 逐类 sigmoid (RT-DETR 用 focal loss, 不是 softmax)
+            // 逐类 sigmoid (RF-DETR 用 focal loss, 不是 softmax)
             float bestProb = -1f;
             int bestClass = -1;
             for (int c = 0; c < numClasses; c++) {
@@ -317,7 +317,7 @@ public class ONNXRTDETR {
             System.loadLibrary(Core.NATIVE_LIBRARY_NAME);
 
             System.out.println("加载模型: " + modelPath);
-            ONNXRTDETR detector = new ONNXRTDETR(modelPath);
+            ONNXRFDETR detector = new ONNXRFDETR(modelPath);
 
             Mat image = Imgcodecs.imread(imagePath);
             if (image.empty()) {
@@ -334,8 +334,8 @@ public class ONNXRTDETR {
             }
 
             Mat result = detector.drawDetections(image, detections);
-            Imgcodecs.imwrite("result_rtdetr.jpg", result);
-            System.out.println("\n结果保存: result_rtdetr.jpg");
+            Imgcodecs.imwrite("result_rfdetr.jpg", result);
+            System.out.println("\n结果保存: result_rfdetr.jpg");
 
             image.release();
             result.release();
