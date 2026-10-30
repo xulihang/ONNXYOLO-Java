@@ -26,7 +26,7 @@ import java.util.*;
  *   2. 在 query×class 上取 top-k (k = numSelect, 默认 160)
  *   3. 按类别阈值过滤, 归一化 cxcywh -> 原图像素 xyxy
  *   4. onomatopoeia 不使用 dets 的框, 改为用 mask 非零像素的外接矩形定位
- *   5. onomatopoeia 的 mask 高度重叠时合并为一个 detection (mask 取并集, 框取并集外接矩形)
+ *   5. onomatopoeia 的 mask 高度重叠或框邻近时合并为一个 detection (mask 取并集, 框取并集外接矩形)
  *   6. 可选的同类重叠抑制: 只保留较小框 (默认关闭; 开启后大框被删,
  *      而大框的 mask 往往才是完整拟声词, 可能导致 mask 不完整)
  *   7. mask 双线性放大到原图尺寸, logit > 0 视为前景
@@ -80,6 +80,9 @@ public class ONNXRFDETRSeg {
     private final Set<Integer> mergeOverlappingMaskClasses = new HashSet<>(Collections.singletonList(ONOMATOPOEIA_CLASS_ID));
     // 两个 mask 的交集 / 较小 mask 面积 >= 该值视为同一个目标
     private float maskMergeThreshold = 0.5f;
+    // 邻近合并: 水平/垂直间隔小于 图像宽/高 * ratio, 且方向对齐时也合并
+    // 默认 1%, 只合并同一拟声词被拆开的相邻笔画, 避免把相邻但独立的拟声词并掉
+    private float proximityMergeGapRatio = 0.01f;
 
     // 重叠时只保留较小框的类别 (默认关闭: 保留所有框, mask 更完整)
     private final Set<Integer> keepSmallerOnOverlapClasses = new HashSet<>();
@@ -208,6 +211,14 @@ public class ONNXRFDETRSeg {
             throw new IllegalArgumentException("maskMergeThreshold 需在 (0, 1] 之间");
         }
         this.maskMergeThreshold = threshold;
+    }
+
+    // 邻近合并间隔, 相对图像宽/高的比例; 设为 0 可关闭邻近合并
+    public void setProximityMergeGapRatio(float ratio) {
+        if (ratio < 0 || ratio > 1) {
+            throw new IllegalArgumentException("proximityMergeGapRatio 需在 [0, 1] 之间");
+        }
+        this.proximityMergeGapRatio = ratio;
     }
 
     // 某类别重叠时是否只保留较小框 (默认关闭)
@@ -409,6 +420,27 @@ public class ONNXRFDETRSeg {
         return minArea > 0 ? inter / minArea : 0;
     }
 
+    // 两个框方向对齐, 且水平/垂直间隔都在阈值内
+    private static boolean isNear(float[] a, float[] b, float gapX, float gapY) {
+        float dx = horizontalGap(a, b);
+        float dy = verticalGap(a, b);
+        if (dx > gapX || dy > gapY) return false;
+        // 至少一个方向有重叠/接触, 避免把对角方向的框合并
+        return dx <= 1e-6f || dy <= 1e-6f;
+    }
+
+    private static float horizontalGap(float[] a, float[] b) {
+        if (a[2] < b[0]) return b[0] - a[2];
+        if (b[2] < a[0]) return a[0] - b[2];
+        return 0f;
+    }
+
+    private static float verticalGap(float[] a, float[] b) {
+        if (a[3] < b[1]) return b[1] - a[3];
+        if (b[3] < a[1]) return a[1] - b[3];
+        return 0f;
+    }
+
     // mask 非零像素的外接矩形; 空 mask 返回 null
     private static Rect maskBoundingRect(Mat mask) {
         if (mask == null || mask.empty()) return null;
@@ -471,17 +503,23 @@ public class ONNXRFDETRSeg {
             areas[i] = countNonZero(data);
         }
 
+        float gapX = proximityMergeGapRatio * w;
+        float gapY = proximityMergeGapRatio * h;
+
         int[] parent = new int[n];
         for (int i = 0; i < n; i++) parent[i] = i;
         for (int i = 0; i < n; i++) {
             for (int j = i + 1; j < n; j++) {
-                // 框不相交时 mask 不会相交
-                float bboxOverlap = overlapOverSmaller(detections.get(i).getBbox(), detections.get(j).getBbox());
-                if (bboxOverlap <= 0) continue;
+                float[] boxI = detections.get(i).getBbox();
+                float[] boxJ = detections.get(j).getBbox();
+                float bboxOverlap = overlapOverSmaller(boxI, boxJ);
+                boolean near = isNear(boxI, boxJ, gapX, gapY);
+                // 既不相交也不邻近时 mask 不会相交
+                if (bboxOverlap <= 0 && !near) continue;
 
                 float maskOverlap = maskOverlapOverSmaller(masks[i], masks[j], areas[i], areas[j]);
-                // mask 高度重叠, 或一个框基本包含另一个框, 都视为同一目标
-                if (maskOverlap >= maskMergeThreshold || bboxOverlap >= maskMergeThreshold) {
+                // mask 高度重叠、一个框基本包含另一个框、或两个框邻近且方向对齐, 都视为同一目标
+                if (near || maskOverlap >= maskMergeThreshold || bboxOverlap >= maskMergeThreshold) {
                     union(parent, i, j);
                 }
             }
