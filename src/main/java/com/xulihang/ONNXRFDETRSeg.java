@@ -83,6 +83,8 @@ public class ONNXRFDETRSeg {
     // 邻近合并: 水平/垂直间隔小于 图像宽/高 * ratio, 且方向对齐时也合并
     // 默认 1%, 只合并同一拟声词被拆开的相邻笔画, 避免把相邻但独立的拟声词并掉
     private float proximityMergeGapRatio = 0.01f;
+    // 丢弃小于 最大连通块面积 * ratio 的 mask 碎片 (气泡边线等噪声)
+    private float maskComponentMinAreaRatio = 0.05f;
 
     // 重叠时只保留较小框的类别 (默认关闭: 保留所有框, mask 更完整)
     private final Set<Integer> keepSmallerOnOverlapClasses = new HashSet<>();
@@ -221,6 +223,14 @@ public class ONNXRFDETRSeg {
         this.proximityMergeGapRatio = ratio;
     }
 
+    // 小于最大连通块该比例的 mask 碎片会被丢弃; 设为 0 可关闭
+    public void setMaskComponentMinAreaRatio(float ratio) {
+        if (ratio < 0 || ratio > 1) {
+            throw new IllegalArgumentException("maskComponentMinAreaRatio 需在 [0, 1] 之间");
+        }
+        this.maskComponentMinAreaRatio = ratio;
+    }
+
     // 某类别重叠时是否只保留较小框 (默认关闭)
     public void setKeepSmallerOnOverlap(int classId, boolean enabled) {
         if (enabled) {
@@ -355,6 +365,10 @@ public class ONNXRFDETRSeg {
             float[] bbox = candidate.bbox;
             if (masks != null && candidate.query < masks.length) {
                 mask = decodeMask(masks[candidate.query], orgW, orgH);
+                if (mergeOverlappingMaskClasses.contains(candidate.classId)
+                        || useMaskBboxClasses.contains(candidate.classId)) {
+                    mask = removeSmallComponents(mask);
+                }
                 if (useMaskBboxClasses.contains(candidate.classId)) {
                     Rect maskRect = maskBoundingRect(mask);
                     if (maskRect != null) {
@@ -439,6 +453,57 @@ public class ONNXRFDETRSeg {
         if (a[3] < b[1]) return b[1] - a[3];
         if (b[3] < a[1]) return a[1] - b[3];
         return 0f;
+    }
+
+    // 去掉 mask 中面积小于 最大连通块 * maskComponentMinAreaRatio 的碎片
+    // (重复 query 的 mask 常把旁边气泡/边框的细线也算进来, 会带偏外接矩形)
+    private Mat removeSmallComponents(Mat mask) {
+        if (mask == null || mask.empty() || maskComponentMinAreaRatio <= 0) return mask;
+
+        Mat labels = new Mat();
+        Mat stats = new Mat();
+        Mat centroids = new Mat();
+        try {
+            int count = Imgproc.connectedComponentsWithStats(mask, labels, stats, centroids, 8, CvType.CV_32S);
+            if (count <= 2) return mask;
+
+            int maxArea = 0;
+            for (int i = 1; i < count; i++) {
+                maxArea = Math.max(maxArea, (int) stats.get(i, Imgproc.CC_STAT_AREA)[0]);
+            }
+            if (maxArea <= 0) return mask;
+            double minArea = maxArea * maskComponentMinAreaRatio;
+
+            boolean[] keep = new boolean[count];
+            boolean dropped = false;
+            keep[0] = false;
+            for (int i = 1; i < count; i++) {
+                keep[i] = stats.get(i, Imgproc.CC_STAT_AREA)[0] >= minArea;
+                if (!keep[i]) dropped = true;
+            }
+            if (!dropped) return mask;
+
+            int w = mask.cols();
+            int h = mask.rows();
+            int[] labelData = new int[w * h];
+            labels.get(0, 0, labelData);
+            byte[] cleaned = new byte[w * h];
+            for (int i = 0; i < labelData.length; i++) {
+                int label = labelData[i];
+                if (label > 0 && label < keep.length && keep[label]) {
+                    cleaned[i] = (byte) 255;
+                }
+            }
+
+            mask.release();
+            Mat result = new Mat(h, w, CvType.CV_8UC1);
+            result.put(0, 0, cleaned);
+            return result;
+        } finally {
+            labels.release();
+            stats.release();
+            centroids.release();
+        }
     }
 
     // mask 非零像素的外接矩形; 空 mask 返回 null
