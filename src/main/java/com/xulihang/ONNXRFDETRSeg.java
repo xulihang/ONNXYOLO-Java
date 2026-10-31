@@ -43,6 +43,7 @@ public class ONNXRFDETRSeg {
             0.25f, 0.25f, 0.50f, 0.50f
     };
 
+    private static final int TEXT_CLASS_ID = 0;
     private static final int ONOMATOPOEIA_CLASS_ID = 1;
     private static final int PANEL_CLASS_ID = 3;
 
@@ -90,6 +91,10 @@ public class ONNXRFDETRSeg {
     private final Set<Integer> keepSmallerOnOverlapClasses = new HashSet<>();
     // 交集面积 / 较小框面积 >= 该值视为重叠
     private float overlapThreshold = 0.5f;
+
+    // masks of the text (and onomatopoeia) detections combined into one image (0/255, original size)
+    private Mat textMask = null;
+    private Mat onomatopoeiaMask = null;
 
     private String inputName;
     private String detsOutputName;   // [1, Q, 4]
@@ -248,6 +253,24 @@ public class ONNXRFDETRSeg {
         this.overlapThreshold = threshold;
     }
 
+    // 调用方负责 release()
+    public Mat getTextMask() {
+        return textMask;
+    }
+
+    public boolean hasTextMask() {
+        return textMask != null && !textMask.empty();
+    }
+
+    // 调用方负责 release()
+    public Mat getOnomatopoeiaMask() {
+        return onomatopoeiaMask;
+    }
+
+    public boolean hasOnomatopoeiaMask() {
+        return onomatopoeiaMask != null && !onomatopoeiaMask.empty();
+    }
+
     // 检测 + 分割
     public List<DetectionResult> detect(Mat image) {
         try {
@@ -275,7 +298,9 @@ public class ONNXRFDETRSeg {
                     }
                 }
 
-                return postprocess(dets[0], labels[0], masks == null ? null : masks[0], orgW, orgH);
+                List<DetectionResult> results = postprocess(dets[0], labels[0], masks == null ? null : masks[0], orgW, orgH);
+                buildTextMask(results, orgW, orgH);
+                return results;
             }
 
         } catch (Exception e) {
@@ -419,6 +444,29 @@ public class ONNXRFDETRSeg {
             kept.addAll(classKept);
         }
         return kept;
+    }
+
+    // 把 text 和 onomatopoeia 类的 mask 分别合并成一张图, 供文字遮罩使用
+    private void buildTextMask(List<DetectionResult> results, int orgW, int orgH) {
+        if (textMask != null) {
+            textMask.release();
+        }
+        if (onomatopoeiaMask != null) {
+            onomatopoeiaMask.release();
+        }
+        textMask = new Mat(orgH, orgW, CvType.CV_8UC1, new Scalar(0));
+        onomatopoeiaMask = new Mat(orgH, orgW, CvType.CV_8UC1, new Scalar(0));
+        for (DetectionResult det : results) {
+            if (det.getMask() == null) {
+                continue;
+            }
+            if (det.getClassId() == TEXT_CLASS_ID) {
+                textMask.setTo(new Scalar(255), det.getMask());
+                onomatopoeiaMask.setTo(new Scalar(255), det.getMask());
+            } else if (det.getClassId() == ONOMATOPOEIA_CLASS_ID) {
+                onomatopoeiaMask.setTo(new Scalar(255), det.getMask());
+            }
+        }
     }
 
     private static float area(float[] box) {
