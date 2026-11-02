@@ -12,12 +12,20 @@ import java.util.*;
 /**
  * KoharuLayout RF-DETR Seg 2XL ONNX 检测/分割器 (漫画版面分析)
  *
- * 模型由 koharu/model.safetensors 导出 (见 koharu/export_onnx.py);
- * INT8 版本由 koharu/quantize_onnx.py 生成, 输出结构不变, 可直接替换模型路径.
- *   输入:  input  [1, 3, 1152, 1152]  拉伸缩放 (非 letterbox), RGB, ImageNet 归一化
- *   输出1: dets   [1, 300, 4]         归一化框 [cx, cy, w, h]
- *   输出2: labels [1, 300, 5]         类别 logits, 最后一列为 no-object, 前 4 列为真实类别
- *   输出3: masks  [1, 300, 288, 288]  实例 mask logits (输入分辨率的 1/4)
+ * 支持两种模型, 均由模型自身的输入形状自动识别:
+ *   1. 分割版 (原版): koharu/koharu_layout_rfdetr_seg_2xl_1152.onnx (或 _int8)
+ *      由 koharu/model.safetensors 导出 (见 koharu/export_onnx.py);
+ *      INT8 版本由 koharu/quantize_onnx.py 生成, 输出结构不变, 可直接替换模型路径.
+ *        输入:  input  [1, 3, 1152, 1152]      拉伸缩放 (非 letterbox), RGB, ImageNet 归一化
+ *        输出1: dets   [1, 300, 4]             归一化框 [cx, cy, w, h]
+ *        输出2: labels [1, 300, 5]             类别 logits, 最后一列为 no-object, 前 4 列为真实类别
+ *        输出3: masks  [1, 300, 288, 288]      实例 mask logits (输入分辨率的 1/4)
+ *   2. 检测版 (768 速度优化): koharu/rfdetr-seg-2xlarge.onnx (或 _int8, 见 koharu/quantize_onnx_768.py)
+ *        输入:  input  [1, 3, 768, 768]        同样的拉伸缩放 + 归一化
+ *        输出1: dets   [1, 300, 4]             同分割版
+ *        输出2: labels [1, 300, 5]             同分割版
+ *        无 masks 输出: 此时只做检测, getTextMask()/getOnomatopoeiaMask() 为空,
+ *        onomatopoeia 直接用 dets 的框, 第 4~7 步的 mask 相关处理全部跳过.
  *
  * 类别: 0=text, 1=onomatopoeia, 2=bubble, 3=panel
  *
@@ -25,11 +33,12 @@ import java.util.*;
  *   1. 丢弃 labels 最后一列, 逐类 sigmoid (focal loss, 不是 softmax)
  *   2. 在 query×class 上取 top-k (k = numSelect, 默认 160)
  *   3. 按类别阈值过滤, 归一化 cxcywh -> 原图像素 xyxy
- *   4. onomatopoeia 不使用 dets 的框, 改为用 mask 非零像素的外接矩形定位
+ *   4. onomatopoeia 不使用 dets 的框, 改为用 mask 非零像素的外接矩形定位 (仅分割版)
  *   5. onomatopoeia 的 mask 高度重叠或框邻近时合并为一个 detection (mask 取并集, 框取并集外接矩形)
+ *      (仅分割版; 检测版无法合并, 重复 query 会各自保留)
  *   6. 可选的同类重叠抑制: 只保留较小框 (默认关闭; 开启后大框被删,
  *      而大框的 mask 往往才是完整拟声词, 可能导致 mask 不完整)
- *   7. mask 双线性放大到原图尺寸, logit > 0 视为前景
+ *   7. mask 双线性放大到原图尺寸, logit > 0 视为前景 (仅分割版)
  */
 public class ONNXRFDETRSeg {
 
@@ -99,7 +108,7 @@ public class ONNXRFDETRSeg {
     private String inputName;
     private String detsOutputName;   // [1, Q, 4]
     private String labelsOutputName; // [1, Q, C+1]
-    private String masksOutputName;  // [1, Q, h, w], 可能不存在
+    private String masksOutputName;  // [1, Q, h, w], 可能不存在 (768 检测版模型没有)
 
     public ONNXRFDETRSeg(String onnxPath) throws OrtException {
         env = OrtEnvironment.getEnvironment();
@@ -161,6 +170,24 @@ public class ONNXRFDETRSeg {
         if (detsOutputName == null || labelsOutputName == null) {
             throw new IllegalStateException("无法识别 RF-DETR Seg 输出: " + outputInfo.keySet());
         }
+        if (masksOutputName == null) {
+            // 768 检测版没有 masks: 退化为纯检测, 拟声词直接用 dets 的框
+            useMaskBboxClasses.clear();
+            mergeOverlappingMaskClasses.clear();
+        }
+    }
+
+    // 模型是否带实例 mask 输出 (768 检测版为 false)
+    public boolean hasMasks() {
+        return masksOutputName != null;
+    }
+
+    public int getInputWidth() {
+        return inpWidth;
+    }
+
+    public int getInputHeight() {
+        return inpHeight;
     }
 
     public void setInputSize(int width, int height) {
@@ -875,10 +902,10 @@ public class ONNXRFDETRSeg {
         }
     }
 
-    // 使用示例: 模型由 koharu/export_onnx.py 导出, INT8 版本由 koharu/quantize_onnx.py 生成
+    // 使用示例: 支持分割版 (1152, 带 mask) 和检测版 (768, 无 mask)
     // 参数: [模型路径] [图片路径] [输出路径]
     public static void main(String[] args) {
-        String modelPath = args.length > 0 ? args[0] : "koharu/koharu_layout_rfdetr_seg_2xl_1152_int8.onnx";
+        String modelPath = args.length > 0 ? args[0] : "koharu/rfdetr-seg-2xlarge_int8.onnx";
         String imagePath = args.length > 1 ? args[1] : "18_094.jpg";
         String outputPath = args.length > 2 ? args[2] : "result_koharu.jpg";
 
