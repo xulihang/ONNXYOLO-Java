@@ -95,6 +95,7 @@ if (detector.hasBubbleTextMask()) {
 | `src/test/java/com/xulihang/BubbleTextMaskTest.java` | 调用 `getBubbleTextMask()` 把气泡内文字涂白并保存结果 |
 | `src/test/java/com/xulihang/RFDETRSegBenchmark.java` | 对比 1152 分割版 / 768 检测版的耗时与检测结果 |
 | `bubble_mask_preview.py` | 直接用 onnxruntime + OpenCV 预览气泡掩膜涂白效果（对照 Java 实现） |
+| `bubble_cv_from_boxes.py` | 纯 OpenCV 从文字/气泡检测框恢复气泡掩膜（检测版模型无 mask 时可用） |
 
 ```powershell
 # 气泡文字覆盖测试：输出 18_094_bubble_text_covered.jpg 与 _mask.png
@@ -102,6 +103,9 @@ java "-Djava.library.path=." -cp $cp com.xulihang.BubbleTextMaskTest
 
 # 模型对比
 java "-Djava.library.path=." -cp $cp com.xulihang.RFDETRSegBenchmark
+
+# 纯 CV 从检测框恢复气泡掩膜（文字框 -> 找包住它的墨线内轮廓；气泡框 -> 框内白色区域填洞）
+python bubble_cv_from_boxes.py --seeds both --out 18_094_cv_both.jpg
 ```
 
 ## 模型文件
