@@ -39,6 +39,10 @@ import java.util.*;
  *   6. 可选的同类重叠抑制: 只保留较小框 (默认关闭; 开启后大框被删,
  *      而大框的 mask 往往才是完整拟声词, 可能导致 mask 不完整)
  *   7. mask 双线性放大到原图尺寸, logit > 0 视为前景 (仅分割版)
+ *
+ * 文字覆盖掩膜:
+ *   getTextMask()/getOnomatopoeiaMask() 随 detect() 生成;
+ *   getBubbleTextMask() 惰性生成 (首次调用时才平滑 + 内缩), 用于把气泡内文字涂白.
  */
 public class ONNXRFDETRSeg {
 
@@ -54,6 +58,7 @@ public class ONNXRFDETRSeg {
 
     private static final int TEXT_CLASS_ID = 0;
     private static final int ONOMATOPOEIA_CLASS_ID = 1;
+    private static final int BUBBLE_CLASS_ID = 2;
     private static final int PANEL_CLASS_ID = 3;
 
     // ImageNet 归一化参数, 顺序 R,G,B
@@ -104,6 +109,14 @@ public class ONNXRFDETRSeg {
     // masks of the text (and onomatopoeia) detections combined into one image (0/255, original size)
     private Mat textMask = null;
     private Mat onomatopoeiaMask = null;
+
+    // 本次 detect() 缓存的气泡实例 mask; bubbleTextMask 在首次
+    // getBubbleTextMask() 调用时才生成 (平滑 + 内缩), 之后复用直到下次 detect()
+    private final List<Mat> bubbleMasks = new ArrayList<>();
+    private Mat bubbleTextMask = null;
+    private int bubbleMaskShrink = 3;
+    private int lastImageWidth = 0;
+    private int lastImageHeight = 0;
 
     private String inputName;
     private String detsOutputName;   // [1, Q, 4]
@@ -280,7 +293,7 @@ public class ONNXRFDETRSeg {
         this.overlapThreshold = threshold;
     }
 
-    // 调用方负责 release()
+    // 文字实例掩膜的并集 (原图尺寸, 0/255). 内部缓存, 不要 release; 下次 detect() 时重建
     public Mat getTextMask() {
         return textMask;
     }
@@ -289,13 +302,96 @@ public class ONNXRFDETRSeg {
         return textMask != null && !textMask.empty();
     }
 
-    // 调用方负责 release()
+    // 拟声词实例掩膜的并集 (原图尺寸, 0/255), 不含 text. 内部缓存, 不要 release
     public Mat getOnomatopoeiaMask() {
         return onomatopoeiaMask;
     }
 
     public boolean hasOnomatopoeiaMask() {
         return onomatopoeiaMask != null && !onomatopoeiaMask.empty();
+    }
+
+    // 气泡文字覆盖掩膜的内缩像素数 (默认 3): 白块退到气泡轮廓线以内, 保留黑边并避免外溢
+    public void setBubbleMaskShrink(int shrink) {
+        if (shrink < 0) {
+            throw new IllegalArgumentException("bubbleMaskShrink 不能小于 0");
+        }
+        this.bubbleMaskShrink = shrink;
+        invalidateBubbleTextMask();
+    }
+
+    public int getBubbleMaskShrink() {
+        return bubbleMaskShrink;
+    }
+
+    /**
+     * 获取可用于覆盖文字的气泡掩膜 (所有 bubble 实例的并集, 原图尺寸, 0/255).
+     * 平滑去锯齿和内缩处理只在首次调用时执行, 之后返回缓存; 每次 detect() 后重新生成.
+     * 需要的图片尺寸和气泡实例来自最近一次 detect().
+     * 返回内部缓存的 Mat, 调用方不要 release (下次 detect() 或 setBubbleMaskShrink() 会重建).
+     *
+     * @return 可像素级涂白文字的气泡掩膜; 尚未调用 detect() 或没有气泡时返回 null/全黑掩膜
+     */
+    public Mat getBubbleTextMask() {
+        if (bubbleTextMask != null) {
+            return bubbleTextMask;
+        }
+        if (lastImageWidth <= 0 || lastImageHeight <= 0) {
+            return null;
+        }
+
+        bubbleTextMask = new Mat(lastImageHeight, lastImageWidth, CvType.CV_8UC1, new Scalar(0));
+        for (Mat mask : bubbleMasks) {
+            bubbleTextMask.setTo(new Scalar(255), mask);
+        }
+        refineBubbleMask(bubbleTextMask, bubbleMaskShrink);
+        return bubbleTextMask;
+    }
+
+    // 克隆并缓存本次检测到的 bubble 实例 mask, 避免调用方 release DetectionResult 后失效
+    private void cacheBubbleMasks(List<DetectionResult> results, int orgW, int orgH) {
+        lastImageWidth = orgW;
+        lastImageHeight = orgH;
+        invalidateBubbleTextMask();
+        for (Mat mask : bubbleMasks) {
+            mask.release();
+        }
+        bubbleMasks.clear();
+
+        for (DetectionResult det : results) {
+            Mat mask = det.getMask();
+            if (det.getClassId() == BUBBLE_CLASS_ID && mask != null && !mask.empty()) {
+                bubbleMasks.add(mask.clone());
+            }
+        }
+    }
+
+    private void invalidateBubbleTextMask() {
+        if (bubbleTextMask != null) {
+            bubbleTextMask.release();
+            bubbleTextMask = null;
+        }
+    }
+
+    // 去锯齿 + 内缩: 模糊后二值化让轮廓变圆滑, 闭/开运算补缺口, 最后腐蚀保留气泡黑边
+    private static void refineBubbleMask(Mat mask, int shrink) {
+        Mat blur = new Mat();
+        Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, new Size(7, 7));
+        Imgproc.GaussianBlur(mask, blur, new Size(0, 0), 2.0);
+        Imgproc.threshold(blur, mask, 127, 255, Imgproc.THRESH_BINARY);
+        Imgproc.morphologyEx(mask, mask, Imgproc.MORPH_CLOSE, kernel);
+        Imgproc.morphologyEx(mask, mask, Imgproc.MORPH_OPEN, kernel);
+        Imgproc.GaussianBlur(mask, blur, new Size(0, 0), 1.5);
+        Imgproc.threshold(blur, mask, 127, 255, Imgproc.THRESH_BINARY);
+        blur.release();
+        kernel.release();
+
+        if (shrink > 0) {
+            Mat erodeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE,
+                    new Size(2 * shrink + 1, 2 * shrink + 1));
+            Imgproc.erode(mask, mask, erodeKernel);
+            erodeKernel.release();
+        }
     }
 
     // 检测 + 分割
@@ -327,6 +423,7 @@ public class ONNXRFDETRSeg {
 
                 List<DetectionResult> results = postprocess(dets[0], labels[0], masks == null ? null : masks[0], orgW, orgH);
                 buildTextMask(results, orgW, orgH);
+                cacheBubbleMasks(results, orgW, orgH);
                 return results;
             }
 
@@ -489,7 +586,6 @@ public class ONNXRFDETRSeg {
             }
             if (det.getClassId() == TEXT_CLASS_ID) {
                 textMask.setTo(new Scalar(255), det.getMask());
-                onomatopoeiaMask.setTo(new Scalar(255), det.getMask());
             } else if (det.getClassId() == ONOMATOPOEIA_CLASS_ID) {
                 onomatopoeiaMask.setTo(new Scalar(255), det.getMask());
             }
@@ -825,6 +921,13 @@ public class ONNXRFDETRSeg {
     }
 
     public void close() throws OrtException {
+        if (textMask != null) textMask.release();
+        if (onomatopoeiaMask != null) onomatopoeiaMask.release();
+        invalidateBubbleTextMask();
+        for (Mat mask : bubbleMasks) {
+            mask.release();
+        }
+        bubbleMasks.clear();
         if (session != null) session.close();
         if (env != null) env.close();
     }
