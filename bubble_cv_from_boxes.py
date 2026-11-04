@@ -9,7 +9,10 @@ Two strategies, chosen by the seed's class:
   text box  -> find the *hole* contour of the ink layer that encloses the text
                cluster.  A bubble outline is a closed black loop, so its inner
                contour is exactly the bubble interior (text included).  This is
-               immune to white *outside* the bubble leaking into the ROI.
+               immune to white *outside* the bubble leaking into the ROI.  A
+               small closing pass first seals the spot where a scalloped
+               bubble edge meets nearby art, which would otherwise merge the
+               bubble with the white area outside it.
   bubble box -> take the white connected component at the box center, fill its
                interior holes (glyphs) and shrink a few px.  A bubble box is
                tight, so this is enough.
@@ -26,17 +29,28 @@ import numpy as np
 
 
 def boxes_from_mask(mask_path, min_area, cluster_px=0):
-    """One box per blob; cluster_px>0 merges glyphs into text lines/blocks."""
+    """One box per blob; cluster_px>0 merges glyphs into text lines/blocks.
+
+    With clustering, min_area applies to the *original* pixels in a cluster,
+    not the dilated blob, so a single speck cannot become a text seed.
+    """
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     if mask is None:
         return []
-    m = (mask > 127).astype(np.uint8)
+    raw = (mask > 127).astype(np.uint8)
+    m = raw
     if cluster_px > 0:
-        m = cv2.dilate(m, cv2.getStructuringElement(
+        m = cv2.dilate(raw, cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (2 * cluster_px + 1, 2 * cluster_px + 1)))
-    n, _, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
-    return [(x, y, x + bw, y + bh)
-            for x, y, bw, bh, area in stats[1:] if area >= min_area]
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    out = []
+    for i, (x, y, bw, bh, area) in enumerate(stats[1:], start=1):
+        if cluster_px > 0:
+            area = int(np.count_nonzero(raw[y:y + bh, x:x + bw] &
+                                        (labels[y:y + bh, x:x + bw] == i)))
+        if area >= min_area:
+            out.append((x, y, x + bw, y + bh))
+    return out
 
 
 def fill_holes(mask):
@@ -117,6 +131,9 @@ def main():
                     help="merge glyph boxes into one text block before search")
     ap.add_argument("--shrink", type=int, default=3,
                     help="erode px so the black bubble outline survives")
+    ap.add_argument("--close-ink", type=int, default=5,
+                    help="close ink by N px before hole search; seals the gap where a "
+                         "bubble outline merges into nearby art (0 = disable)")
     ap.add_argument("--max-bubble-frac", type=float, default=0.05,
                     help="reject a hole larger than this fraction of the page")
     ap.add_argument("--out", default="18_094_cv_from_detections.jpg")
@@ -127,7 +144,13 @@ def main():
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    contours, holes = find_bubble_holes(ink, min_area=1500)
+    ink_holes = ink
+    if args.close_ink > 0:
+        ink_holes = cv2.morphologyEx(
+            ink, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                      (args.close_ink, args.close_ink)))
+    contours, holes = find_bubble_holes(ink_holes, min_area=1500)
     max_area = args.max_bubble_frac * h * w
 
     dets = []
@@ -136,11 +159,13 @@ def main():
             dets = [(tuple(d["box"]), d.get("kind", "bubble"))
                     for d in json.load(f)]
     else:
+        # bubble boxes first: a tight box clips any hole that leaked into
+        # nearby art, so its mask wins the dedupe over a text-derived one
+        if args.seeds in ("bubble", "both"):
+            dets += [(b, "bubble") for b in boxes_from_mask(args.bubble_mask, 100)]
         if args.seeds in ("text", "both"):
             dets += [(b, "text") for b in boxes_from_mask(
                 args.text_mask, 100, args.cluster_px)]
-        if args.seeds in ("bubble", "both"):
-            dets += [(b, "bubble") for b in boxes_from_mask(args.bubble_mask, 100)]
 
     union = np.zeros_like(gray)
     dbg = bgr.copy()
