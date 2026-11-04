@@ -332,6 +332,11 @@ public class ONNXRFDETRSeg {
      *
      * @return 可像素级涂白文字的气泡掩膜; 尚未调用 detect() 或没有气泡时返回 null/全黑掩膜
      */
+    // 是否有可用于覆盖文字的气泡 (只检查最近一次 detect() 的结果, 不触发生成)
+    public boolean hasBubbleTextMask() {
+        return !bubbleMasks.isEmpty();
+    }
+
     public Mat getBubbleTextMask() {
         if (bubbleTextMask != null) {
             return bubbleTextMask;
