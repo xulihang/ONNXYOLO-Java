@@ -13,9 +13,14 @@ Two strategies, chosen by the seed's class:
                small closing pass first seals the spot where a scalloped
                bubble edge meets nearby art, which would otherwise merge the
                bubble with the white area outside it.
-  bubble box -> take the white connected component at the box center, fill its
-               interior holes (glyphs) and shrink a few px.  A bubble box is
-               tight, so this is enough.
+  bubble box -> prefer the ink hole whose bounding box matches the detection
+               box, which follows the drawn outline and never spills into the
+               white page ground.  Only when no outline closes into a matching
+               hole (e.g. a bubble tangent to a panel border) fall back to the
+               white component at the box centre, clipped by the box.
+
+The hole search runs on several ink-closing levels because outlines with gaps
+only close up with a larger kernel; each seed picks its best match across them.
 
 Box sources for this demo are the saved model masks (each blob -> a box), which
 stand in for the detection-only model's output.  --boxes-json replaces them with
@@ -87,12 +92,88 @@ def smooth_shrink(mask, shrink):
     return mask
 
 
+def build_hole_levels(ink, close_sizes, min_area=1500):
+    """findContours at several ink-closing levels.
+
+    A bubble outline with a hairline gap only becomes a closed loop once the
+    ink is closed by a wide enough kernel, so try a ladder of sizes.
+    """
+    levels = []
+    for k in close_sizes:
+        ik = ink
+        if k > 0:
+            ik = cv2.morphologyEx(
+                ink, cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+        contours, holes = find_bubble_holes(ik, min_area)
+        levels.append((k, contours, holes))
+    return levels
+
+
+def pick_text_hole(levels, box, max_area):
+    """Innermost hole (smallest bbox) that fully contains a text box."""
+    tx0, ty0, tx1, ty1 = box
+    best = None
+    for _, contours, holes in levels:
+        for ci, area, (hx, hy, hw, hh) in holes:
+            if hx <= tx0 and hy <= ty0 and hx + hw >= tx1 and hy + hh >= ty1:
+                if area > max_area:
+                    continue
+                if best is None or hw * hh < best[0]:
+                    best = (hw * hh, contours, ci)
+    return (best[1], best[2]) if best else None
+
+
+def pick_bubble_hole(levels, box, max_area):
+    """Ink hole whose bounding box best matches a bubble detection box."""
+    bx0, by0, bx1, by1 = box
+    barea = max(1, (bx1 - bx0) * (by1 - by0))
+    best = None
+    for _, contours, holes in levels:
+        for ci, area, (hx, hy, hw, hh) in holes:
+            harea = hw * hh
+            if area > max_area or harea > 4 * barea:
+                continue
+            ix0, iy0 = max(bx0, hx), max(by0, hy)
+            ix1, iy1 = min(bx1, hx + hw), min(by1, hy + hh)
+            inter = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+            if inter < 0.5 * barea:       # hole must cover most of the box
+                continue
+            score = inter / (barea + harea - inter)
+            if best is None or score > best[0]:
+                best = (score, contours, ci)
+    return (best[1], best[2]) if best else None
+
+
+def segment_seed(kind, box, gray, levels, shrink, max_area):
+    """Bubble mask for one detection box, or None."""
+    if kind == "text":
+        found = pick_text_hole(levels, box, max_area)
+    else:
+        found = pick_bubble_hole(levels, box, max_area)
+    if found:
+        contours, ci = found
+        m = np.zeros_like(gray)
+        cv2.drawContours(m, contours, ci, 255, cv2.FILLED)
+        m = smooth_shrink(m, shrink)
+        # a text seed only makes sense on a light bubble ground; white text on
+        # a black (inverted) balloon would otherwise fill the black area
+        if kind == "text" and cv2.mean(gray, m)[0] < 150:
+            return None
+        return m
+    if kind == "bubble":                  # outline never closed (panel-tangent
+        return from_bubble_box(gray, box, shrink)   # bubble): clip by the box
+    return None
+
+
 def from_bubble_box(gray, box, shrink):
     """White component at the box center, holes filled -> bubble mask."""
     h, w = gray.shape
     x0, y0, x1, y1 = box
     x0, y0 = max(0, x0), max(0, y0)
     x1, y1 = min(w, x1), min(h, y1)
+    if x1 <= x0 or y1 <= y0:
+        return None
     roi = gray[y0:y1, x0:x1]
     _, ri = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     white = 255 - ri
@@ -131,10 +212,10 @@ def main():
                     help="merge glyph boxes into one text block before search")
     ap.add_argument("--shrink", type=int, default=3,
                     help="erode px so the black bubble outline survives")
-    ap.add_argument("--close-ink", type=int, default=5,
-                    help="close ink by N px before hole search; seals the gap where a "
-                         "bubble outline merges into nearby art (0 = disable)")
-    ap.add_argument("--max-bubble-frac", type=float, default=0.05,
+    ap.add_argument("--hole-levels", default="0,5,9,13,17",
+                    help="ink closing sizes for the hole search; outlines with gaps "
+                         "only close at larger sizes")
+    ap.add_argument("--max-bubble-frac", type=float, default=0.15,
                     help="reject a hole larger than this fraction of the page")
     ap.add_argument("--out", default="18_094_cv_from_detections.jpg")
     ap.add_argument("--ref-mask", default="18_094_mask_bubble.png")
@@ -144,13 +225,7 @@ def main():
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    ink_holes = ink
-    if args.close_ink > 0:
-        ink_holes = cv2.morphologyEx(
-            ink, cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                      (args.close_ink, args.close_ink)))
-    contours, holes = find_bubble_holes(ink_holes, min_area=1500)
+    levels = build_hole_levels(ink, [int(k) for k in args.hole_levels.split(",")])
     max_area = args.max_bubble_frac * h * w
 
     dets = []
@@ -171,21 +246,7 @@ def main():
     dbg = bgr.copy()
     kept = []
     for box, kind in dets:
-        if kind == "text":
-            # innermost ink hole that fully contains the text box
-            tx0, ty0, tx1, ty1 = box
-            best = None
-            for ci, area, (hx, hy, hw, hh) in holes:
-                if hx <= tx0 and hy <= ty0 and hx + hw >= tx1 and hy + hh >= ty1:
-                    if best is None or hw * hh < best[1]:
-                        best = (ci, hw * hh, area)
-            if best is None or best[2] > max_area:
-                continue
-            m = np.zeros_like(gray)
-            cv2.drawContours(m, contours, best[0], 255, cv2.FILLED)
-            m = smooth_shrink(m, args.shrink)
-        else:
-            m = from_bubble_box(gray, box, args.shrink)
+        m = segment_seed(kind, box, gray, levels, args.shrink, max_area)
         if m is None or np.count_nonzero(m) < 800:
             continue
         # text lines of one bubble all recover the same bubble: dedupe
