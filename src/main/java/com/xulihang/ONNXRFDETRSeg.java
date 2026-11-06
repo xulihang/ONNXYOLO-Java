@@ -33,6 +33,9 @@ import java.util.*;
  *   1. 丢弃 labels 最后一列, 逐类 sigmoid (focal loss, 不是 softmax)
  *   2. 在 query×class 上取 top-k (k = numSelect, 默认 160)
  *   3. 按类别阈值过滤, 归一化 cxcywh -> 原图像素 xyxy
+ *   3.5 跨类别仲裁: 同一 query 被多个类别输出时, 若有 onomatopoeia 则只保留它;
+ *      与 onomatopoeia 框重叠的其它类别框也丢弃
+ *      (逐类 sigmoid 会让同一个拟声词同时命中 text 和 onomatopoeia; 见 setPreferredQueryClasses)
  *   4. onomatopoeia 不使用 dets 的框, 改为用 mask 非零像素的外接矩形定位 (仅分割版)
  *   5. onomatopoeia 的 mask 高度重叠或框邻近时合并为一个 detection (mask 取并集, 框取并集外接矩形)
  *      (仅分割版; 检测版无法合并, 重复 query 会各自保留)
@@ -105,6 +108,12 @@ public class ONNXRFDETRSeg {
     private final Set<Integer> keepSmallerOnOverlapClasses = new HashSet<>();
     // 交集面积 / 较小框面积 >= 该值视为重叠
     private float overlapThreshold = 0.5f;
+
+    // 跨类别仲裁: 同一 query 被多个类别同时输出时保留的类别 (默认拟声词)
+    // RF-DETR 逐类 sigmoid, 同一个拟声词常被 text 和 onomatopoeia 各输出一次;
+    // 被仲裁淘汰的是 suppressedByPreferredClasses, 默认 text
+    private Set<Integer> preferredQueryClasses = new HashSet<>(Collections.singletonList(ONOMATOPOEIA_CLASS_ID));
+    private final Set<Integer> suppressedByPreferredClasses = new HashSet<>(Collections.singletonList(TEXT_CLASS_ID));
 
     // masks of the text (and onomatopoeia) detections combined into one image (0/255, original size)
     private Mat textMask = null;
@@ -249,6 +258,27 @@ public class ONNXRFDETRSeg {
             mergeOverlappingMaskClasses.add(classId);
         } else {
             mergeOverlappingMaskClasses.remove(classId);
+        }
+    }
+
+    // 跨类别仲裁: 同一 query 被多个类别输出时, 若其中有 keepClasses 里的类别, 只保留它们
+    // (默认 onomatopoeia). 传空集合则关闭
+    public void setPreferredQueryClasses(int... classIds) {
+        preferredQueryClasses = new HashSet<>();
+        if (classIds != null) {
+            for (int classId : classIds) {
+                preferredQueryClasses.add(classId);
+            }
+        }
+    }
+
+    // 显式指定被跨类别仲裁淘汰的类别
+    public void setSuppressedByPreferredClasses(int... classIds) {
+        suppressedByPreferredClasses.clear();
+        if (classIds != null) {
+            for (int classId : classIds) {
+                suppressedByPreferredClasses.add(classId);
+            }
         }
     }
 
@@ -511,6 +541,8 @@ public class ONNXRFDETRSeg {
                     new float[]{x1, y1, x2, y2}));
         }
 
+        candidates = resolveCrossClassQueries(candidates);
+        candidates = suppressOverlappedByPreferredClasses(candidates);
         candidates = suppressOverlappingKeepingSmaller(candidates);
 
         List<DetectionResult> results = new ArrayList<>(candidates.size());
@@ -537,7 +569,127 @@ public class ONNXRFDETRSeg {
             }
             results.add(new DetectionResult(candidate.classId, bbox, candidate.score, mask));
         }
+        // 拟声词框改成 mask 外接矩形后可能与原始 dets 不同, 此时再做一次跨类别重叠仲裁
+        results = suppressOverlappedResultsByPreferredClasses(results);
         return mergeOverlappingMasks(results);
+    }
+
+    // 同一 query 被多个类别同时输出时 (逐类 sigmoid, 同一拟声词常同时命中 text 和 onomatopoeia):
+    // 若其中有 preferredQueryClasses 里的类别, 只保留它们; 否则丢弃 suppressedByPreferredClasses 里的类别.
+    // 只命中一个类别的 query 不受影响
+    private List<Candidate> resolveCrossClassQueries(List<Candidate> candidates) {
+        if (preferredQueryClasses.isEmpty() && suppressedByPreferredClasses.isEmpty()) {
+            return candidates;
+        }
+        Map<Integer, List<Candidate>> byQuery = new LinkedHashMap<>();
+        for (Candidate candidate : candidates) {
+            byQuery.computeIfAbsent(candidate.query, k -> new ArrayList<>()).add(candidate);
+        }
+
+        List<Candidate> kept = new ArrayList<>(candidates.size());
+        for (List<Candidate> group : byQuery.values()) {
+            Set<Integer> classes = new HashSet<>();
+            for (Candidate candidate : group) {
+                classes.add(candidate.classId);
+            }
+            if (classes.size() == 1) {
+                kept.addAll(group);
+                continue;
+            }
+            List<Candidate> preferred = new ArrayList<>();
+            for (Candidate candidate : group) {
+                if (preferredQueryClasses.contains(candidate.classId)) {
+                    preferred.add(candidate);
+                }
+            }
+            for (Candidate candidate : group) {
+                if (!preferred.isEmpty()) {
+                    if (preferredQueryClasses.contains(candidate.classId)) {
+                        kept.add(candidate);
+                    }
+                } else if (!suppressedByPreferredClasses.contains(candidate.classId)) {
+                    kept.add(candidate);
+                }
+            }
+        }
+        return kept;
+    }
+
+    // 不同 query 产出、但与 preferredQueryClasses 框重叠的其它类别框也丢弃
+    // (同一拟声词被拆成多个 query 时, 其中一个可能被判成 text)
+    private static List<Candidate> suppressOverlappedByPreferredClasses(List<Candidate> candidates,
+                                                                        Set<Integer> preferredClasses,
+                                                                        Set<Integer> suppressedClasses,
+                                                                        float overlapThreshold) {
+        List<Candidate> preferred = new ArrayList<>();
+        for (Candidate candidate : candidates) {
+            if (preferredClasses.contains(candidate.classId)) {
+                preferred.add(candidate);
+            }
+        }
+        if (preferred.isEmpty()) {
+            return candidates;
+        }
+
+        List<Candidate> kept = new ArrayList<>(candidates.size());
+        for (Candidate candidate : candidates) {
+            if (preferredClasses.contains(candidate.classId)
+                    || !suppressedClasses.contains(candidate.classId)) {
+                kept.add(candidate);
+                continue;
+            }
+            boolean overlapped = false;
+            for (Candidate pref : preferred) {
+                if (overlapOverSmaller(candidate.bbox, pref.bbox) >= overlapThreshold) {
+                    overlapped = true;
+                    break;
+                }
+            }
+            if (!overlapped) {
+                kept.add(candidate);
+            }
+        }
+        return kept;
+    }
+
+    // 淘汰被仲裁掉的结果 (其 mask 随之释放)
+    private List<Candidate> suppressOverlappedByPreferredClasses(List<Candidate> candidates) {
+        return suppressOverlappedByPreferredClasses(candidates, preferredQueryClasses,
+                suppressedByPreferredClasses, overlapThreshold);
+    }
+
+    // 同上的 DetectionResult 版本, 在 mask 外接矩形确定后调用
+    private List<DetectionResult> suppressOverlappedResultsByPreferredClasses(List<DetectionResult> results) {
+        if (preferredQueryClasses.isEmpty()) {
+            return results;
+        }
+        List<Candidate> candidates = new ArrayList<>(results.size());
+        for (DetectionResult det : results) {
+            candidates.add(new Candidate(0, det.getClassId(), det.getConfidence(), det.getBbox()));
+        }
+        List<Candidate> kept = suppressOverlappedByPreferredClasses(candidates, preferredQueryClasses,
+                suppressedByPreferredClasses, overlapThreshold);
+        if (kept.size() == results.size()) {
+            return results;
+        }
+        // Candidate 与原结果按 bbox 数组对象一一对应
+        List<DetectionResult> out = new ArrayList<>(kept.size());
+        boolean[] used = new boolean[results.size()];
+        for (Candidate candidate : kept) {
+            for (int i = 0; i < results.size(); i++) {
+                if (!used[i] && results.get(i).getBbox() == candidate.bbox) {
+                    used[i] = true;
+                    out.add(results.get(i));
+                    break;
+                }
+            }
+        }
+        for (int i = 0; i < results.size(); i++) {
+            if (!used[i]) {
+                results.get(i).release();
+            }
+        }
+        return out;
     }
 
     // 同一类别内, 若两个框重叠 (交集 / 较小框面积 >= 阈值), 只保留较小的那个

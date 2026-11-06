@@ -59,6 +59,14 @@ detector.close();
 默认类别阈值：text `0.25`、onomatopoeia `0.25`、bubble `0.50`、panel `0.50`，可通过
 `setClassThreshold(classId, threshold)` 或 `setClassThresholds(...)` 调整。
 
+**跨类别仲裁**：模型逐类 sigmoid，同一个拟声词常被 text 和 onomatopoeia 各输出一次（框几乎重合）。
+后处理默认：
+
+1. 同一 query 同时命中多个类别时，只保留 onomatopoeia；
+2. 不同 query、但与 onomatopoeia 框重叠（交集 / 较小框面积 ≥ `overlapThreshold`，默认 0.5）的 text 框也丢弃。
+
+可通过 `setPreferredQueryClasses(...)` / `setSuppressedByPreferredClasses(...)` 改用其它类别或关闭。
+
 #### 文字覆盖掩膜
 
 一次 `detect()` 之后即可获取三类掩膜（0/255，原图尺寸）：
