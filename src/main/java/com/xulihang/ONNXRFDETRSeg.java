@@ -131,11 +131,32 @@ public class ONNXRFDETRSeg {
     private String detsOutputName;   // [1, Q, 4]
     private String labelsOutputName; // [1, Q, C+1]
     private String masksOutputName;  // [1, Q, h, w], 可能不存在 (768 检测版模型没有)
+    // masks 输出的空间尺寸; 为 0 时按输入尺寸 / 4 推断
+    private int maskHeight = 0;
+    private int maskWidth = 0;
 
+    /**
+     * 默认关闭 ORT 的 CPU 内存 arena.
+     * 长边 1152 的 2XL 模型每帧中间张量约 3GB, 开启 arena 后 ORT 会把峰值 (约 6GB)
+     * 一直占着不还, 进程 RSS 在第二帧后停在 ~6GB; 关闭后每帧用完即还给系统,
+     * 20 张图以内的批处理实测 RSS 稳定在 ~300MB (实测 int8 2XL 1152 推理耗时基本不变).
+     * 需要更高吞吐且内存充裕时, 用 useMemoryArena=true 构造.
+     */
     public ONNXRFDETRSeg(String onnxPath) throws OrtException {
+        this(onnxPath, false);
+    }
+
+    /**
+     * @param useMemoryArena 是否启用 ORT 的 CPU 内存 arena. 默认 false (RSS 低);
+     *                       true 时推理中间结果复用同一块预分配内存, 理论上更快,
+     *                       但 2XL 模型会在首帧后长期占用约 6GB.
+     */
+    public ONNXRFDETRSeg(String onnxPath, boolean useMemoryArena) throws OrtException {
         env = OrtEnvironment.getEnvironment();
-        OrtSession.SessionOptions sessionOptions = new OrtSession.SessionOptions();
-        session = env.createSession(Paths.get(onnxPath).toAbsolutePath().toString(), sessionOptions);
+        try (OrtSession.SessionOptions sessionOptions = new OrtSession.SessionOptions()) {
+            sessionOptions.setCPUArenaAllocator(useMemoryArena);
+            session = env.createSession(Paths.get(onnxPath).toAbsolutePath().toString(), sessionOptions);
+        }
         initModelInfo();
     }
 
@@ -191,6 +212,16 @@ public class ONNXRFDETRSeg {
 
         if (detsOutputName == null || labelsOutputName == null) {
             throw new IllegalStateException("无法识别 RF-DETR Seg 输出: " + outputInfo.keySet());
+        }
+        if (masksOutputName != null) {
+            ValueInfo info = outputInfo.get(masksOutputName).getInfo();
+            if (info instanceof TensorInfo) {
+                long[] shape = ((TensorInfo) info).getShape();
+                if (shape.length == 4 && shape[2] > 0 && shape[3] > 0) {
+                    maskHeight = (int) shape[2];
+                    maskWidth = (int) shape[3];
+                }
+            }
         }
         if (masksOutputName == null) {
             // 768 检测版没有 masks: 退化为纯检测, 拟声词直接用 dets 的框
@@ -441,22 +472,25 @@ public class ONNXRFDETRSeg {
             try (OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(inputData), inputShape);
                  OrtSession.Result result = session.run(Collections.singletonMap(inputName, inputTensor))) {
 
-                float[][][] dets = (float[][][]) result.get(detsOutputName)
-                        .orElseThrow(() -> new IllegalStateException("缺少 dets 输出"))
-                        .getValue();
-                float[][][] labels = (float[][][]) result.get(labelsOutputName)
-                        .orElseThrow(() -> new IllegalStateException("缺少 labels 输出"))
-                        .getValue();
+                // getValue() 会把输出解包成 [1, 300, 288, 288] 的 Java 四维数组 (~100MB/帧),
+                // 这里直接从原生缓冲区读, 避免每帧上百 MB 的临时分配和 GC 压力
+                OnnxTensor detsTensor = (OnnxTensor) result.get(detsOutputName)
+                        .orElseThrow(() -> new IllegalStateException("缺少 dets 输出"));
+                OnnxTensor labelsTensor = (OnnxTensor) result.get(labelsOutputName)
+                        .orElseThrow(() -> new IllegalStateException("缺少 labels 输出"));
 
-                float[][][][] masks = null;
+                float[][] dets = readMatrix(detsTensor, 4);
+                float[][] labels = readMatrix(labelsTensor, -1);
+
+                float[][] masks = null;
                 if (masksOutputName != null) {
                     Optional<OnnxValue> maskValue = result.get(masksOutputName);
                     if (maskValue.isPresent()) {
-                        masks = (float[][][][]) maskValue.get().getValue();
+                        masks = readMaskPlanes((OnnxTensor) maskValue.get());
                     }
                 }
 
-                List<DetectionResult> results = postprocess(dets[0], labels[0], masks == null ? null : masks[0], orgW, orgH);
+                List<DetectionResult> results = postprocess(dets, labels, masks, orgW, orgH);
                 buildTextMask(results, orgW, orgH);
                 cacheBubbleMasks(results, orgW, orgH);
                 return results;
@@ -465,6 +499,45 @@ public class ONNXRFDETRSeg {
         } catch (Exception e) {
             throw new RuntimeException("推理失败: " + e.getMessage(), e);
         }
+    }
+
+    // [1, Q, cols] 输出 -> float[Q][cols]; cols 传 -1 时按形状推断
+    private static float[][] readMatrix(OnnxTensor tensor, int cols) {
+        long[] shape = tensor.getInfo().getShape();
+        if (shape.length != 3 || shape[1] <= 0) {
+            throw new IllegalStateException("输出形状不符: " + Arrays.toString(shape));
+        }
+        int queries = (int) shape[1];
+        int width = cols > 0 ? cols : (int) shape[2];
+        FloatBuffer src = tensor.getFloatBuffer();
+        float[][] out = new float[queries][];
+        float[] row = new float[width];
+        for (int q = 0; q < queries; q++) {
+            src.position(q * width);
+            src.get(row);
+            out[q] = row.clone();
+        }
+        return out;
+    }
+
+    // [1, Q, h, w] mask logits -> float[Q][h*w], 每帧只保留 h*w 大小的扁平数组
+    // (整个张量是 Q*h*w 个 float, 四维/三维 Java 数组的开销远大于数据本身)
+    private static float[][] readMaskPlanes(OnnxTensor tensor) {
+        long[] shape = tensor.getInfo().getShape();
+        if (shape.length != 4 || shape[1] <= 0 || shape[2] <= 0 || shape[3] <= 0) {
+            throw new IllegalStateException("mask 输出形状不符: " + Arrays.toString(shape));
+        }
+        int queries = (int) shape[1];
+        int planeSize = (int) (shape[2] * shape[3]);
+        FloatBuffer src = tensor.getFloatBuffer();
+        float[][] planes = new float[queries][];
+        float[] plane = new float[planeSize];
+        for (int q = 0; q < queries; q++) {
+            src.position(q * planeSize);
+            src.get(plane);
+            planes[q] = plane.clone();
+        }
+        return planes;
     }
 
     // 预处理: 拉伸到输入尺寸, BGR->RGB, (x/255-mean)/std, 输出 CHW float 数组
@@ -483,28 +556,30 @@ public class ONNXRFDETRSeg {
 
         Mat resized = new Mat();
         Imgproc.resize(bgr, resized, new Size(inpWidth, inpHeight), 0, 0, Imgproc.INTER_LINEAR);
+        if (converted != null) converted.release();
 
+        // 直接读成 RGB, 省掉中间 Mat
         byte[] pixels = new byte[inpHeight * inpWidth * 3];
+        Imgproc.cvtColor(resized, resized, Imgproc.COLOR_BGR2RGB);
         resized.get(0, 0, pixels);
+        resized.release();
 
         float[] data = new float[3 * inpHeight * inpWidth];
         int plane = inpHeight * inpWidth;
         for (int i = 0; i < plane; i++) {
-            int b = pixels[i * 3] & 0xFF;
+            int r = pixels[i * 3] & 0xFF;
             int g = pixels[i * 3 + 1] & 0xFF;
-            int r = pixels[i * 3 + 2] & 0xFF;
+            int b = pixels[i * 3 + 2] & 0xFF;
             data[i] = (float) ((r / 255.0 - MEAN[0]) / STD[0]);
             data[plane + i] = (float) ((g / 255.0 - MEAN[1]) / STD[1]);
             data[2 * plane + i] = (float) ((b / 255.0 - MEAN[2]) / STD[2]);
         }
 
-        resized.release();
-        if (converted != null) converted.release();
         return data;
     }
 
     // 后处理: 丢弃 no-object 列 -> sigmoid -> top-k -> 类别阈值 -> 重叠抑制 -> 框/mask 映射
-    private List<DetectionResult> postprocess(float[][] dets, float[][] labels, float[][][] masks,
+    private List<DetectionResult> postprocess(float[][] dets, float[][] labels, float[][] maskPlanes,
                                               int orgW, int orgH) {
         int queries = labels.length;
         int logitCount = labels[0].length;
@@ -546,32 +621,44 @@ public class ONNXRFDETRSeg {
         candidates = suppressOverlappingKeepingSmaller(candidates);
 
         List<DetectionResult> results = new ArrayList<>(candidates.size());
-        for (Candidate candidate : candidates) {
-            Mat mask = null;
-            float[] bbox = candidate.bbox;
-            if (masks != null && candidate.query < masks.length) {
-                mask = decodeMask(masks[candidate.query], orgW, orgH);
-                if (mergeOverlappingMaskClasses.contains(candidate.classId)
-                        || useMaskBboxClasses.contains(candidate.classId)) {
-                    mask = removeSmallComponents(mask);
-                }
-                if (useMaskBboxClasses.contains(candidate.classId)) {
-                    Rect maskRect = maskBoundingRect(mask);
-                    if (maskRect != null) {
-                        bbox = new float[]{
-                                maskRect.x,
-                                maskRect.y,
-                                maskRect.x + maskRect.width - 1,
-                                maskRect.y + maskRect.height - 1
-                        };
+        boolean decoded = false;
+        try {
+            for (Candidate candidate : candidates) {
+                Mat mask = null;
+                float[] bbox = candidate.bbox;
+                if (maskPlanes != null && candidate.query < maskPlanes.length) {
+                    mask = decodeMask(maskPlanes[candidate.query], orgW, orgH);
+                    decoded = true;
+                    if (mergeOverlappingMaskClasses.contains(candidate.classId)
+                            || useMaskBboxClasses.contains(candidate.classId)) {
+                        mask = removeSmallComponents(mask);
+                    }
+                    if (useMaskBboxClasses.contains(candidate.classId)) {
+                        Rect maskRect = maskBoundingRect(mask);
+                        if (maskRect != null) {
+                            bbox = new float[]{
+                                    maskRect.x,
+                                    maskRect.y,
+                                    maskRect.x + maskRect.width - 1,
+                                    maskRect.y + maskRect.height - 1
+                            };
+                        }
                     }
                 }
+                results.add(new DetectionResult(candidate.classId, bbox, candidate.score, mask));
             }
-            results.add(new DetectionResult(candidate.classId, bbox, candidate.score, mask));
+            // 拟声词框改成 mask 外接矩形后可能与原始 dets 不同, 此时再做一次跨类别重叠仲裁
+            results = suppressOverlappedResultsByPreferredClasses(results);
+            return mergeOverlappingMasks(results);
+        } catch (RuntimeException | Error e) {
+            // 中途失败时, 已解码的 mask 不能丢引用, 否则原生内存永不回收
+            if (decoded) {
+                for (DetectionResult det : results) {
+                    det.release();
+                }
+            }
+            throw e;
         }
-        // 拟声词框改成 mask 外接矩形后可能与原始 dets 不同, 此时再做一次跨类别重叠仲裁
-        results = suppressOverlappedResultsByPreferredClasses(results);
-        return mergeOverlappingMasks(results);
     }
 
     // 同一 query 被多个类别同时输出时 (逐类 sigmoid, 同一拟声词常同时命中 text 和 onomatopoeia):
@@ -992,33 +1079,32 @@ public class ONNXRFDETRSeg {
         return (float) inter / minArea;
     }
 
-    // mask logits [h, w] -> 原图尺寸二值 mask (0/255)
-    private Mat decodeMask(float[][] maskLogits, int orgW, int orgH) {
-        int maskH = maskLogits.length;
-        int maskW = maskLogits[0].length;
-
-        float[] flat = new float[maskH * maskW];
-        for (int y = 0; y < maskH; y++) {
-            System.arraycopy(maskLogits[y], 0, flat, y * maskW, maskW);
+    // mask logits (h*w 扁平) -> 原图尺寸二值 mask (0/255)
+    private Mat decodeMask(float[] maskLogits, int orgW, int orgH) {
+        int maskH = maskHeight > 0 ? maskHeight : inpHeight / 4;
+        int maskW = maskWidth > 0 ? maskWidth : inpWidth / 4;
+        if ((long) maskH * maskW != maskLogits.length) {
+            throw new IllegalStateException("mask 尺寸不符: " + maskH + "x" + maskW
+                    + " vs " + maskLogits.length);
         }
 
         Mat logits = new Mat(maskH, maskW, CvType.CV_32FC1);
-        logits.put(0, 0, flat);
+        logits.put(0, 0, maskLogits);
 
-        Mat resized = new Mat();
-        Imgproc.resize(logits, resized, new Size(orgW, orgH), 0, 0, Imgproc.INTER_LINEAR);
-
-        Mat binary = new Mat();
-        // logit > 0 视为前景
-        Imgproc.threshold(resized, binary, 0.0, 255.0, Imgproc.THRESH_BINARY);
-
-        // threshold 会保留 CV_32F, 转成 CV_8UC1 便于绘制和保存
-        Mat mask = new Mat();
-        binary.convertTo(mask, CvType.CV_8UC1);
-
+        // 先在 288x288 上二值化 (logit > 0 视为前景), 再从 0/255 小图放大:
+        // 原图尺寸的缓冲始终只有 1 字节/像素, 不再是中间 4 字节/像素的 float 大图
+        Mat small = new Mat();
+        Imgproc.threshold(logits, small, 0.0, 255.0, Imgproc.THRESH_BINARY);
         logits.release();
-        resized.release();
-        binary.release();
+        Mat smallU8 = new Mat();
+        small.convertTo(smallU8, CvType.CV_8UC1);
+        small.release();
+
+        Mat mask = new Mat();
+        Imgproc.resize(smallU8, mask, new Size(orgW, orgH), 0, 0, Imgproc.INTER_LINEAR);
+        smallU8.release();
+        // 双线性放大后重新二值化, 保证 mask 只有 0/255
+        Imgproc.threshold(mask, mask, 127.0, 255.0, Imgproc.THRESH_BINARY);
         return mask;
     }
 
@@ -1078,8 +1164,14 @@ public class ONNXRFDETRSeg {
     }
 
     public void close() throws OrtException {
-        if (textMask != null) textMask.release();
-        if (onomatopoeiaMask != null) onomatopoeiaMask.release();
+        if (textMask != null) {
+            textMask.release();
+            textMask = null;
+        }
+        if (onomatopoeiaMask != null) {
+            onomatopoeiaMask.release();
+            onomatopoeiaMask = null;
+        }
         invalidateBubbleTextMask();
         for (Mat mask : bubbleMasks) {
             mask.release();
